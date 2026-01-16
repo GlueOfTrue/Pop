@@ -4,8 +4,9 @@ import hashlib
 import os
 import tempfile
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
+from .crypto import EncryptionResult, encrypt_stream
 from .paths import OBJECTS_DIRNAME
 from .util import DEFAULT_CHUNK_SIZE
 
@@ -25,35 +26,42 @@ def sha256_file(path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> str:
     return h.hexdigest()
 
 
-def store_file_object(storage_root: Path, src: Path,
-                      chunk_size: int = DEFAULT_CHUNK_SIZE) -> Tuple[str, int, Path, bool]:
+def store_encrypted_object(
+    storage_root: Path,
+    src: Path,
+    key: bytes,
+    aad: bytes,
+    compression_level: Optional[int],
+    compression_algo: str = "zlib",
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+) -> Tuple[EncryptionResult, Path, bool]:
     """
-    Stream file into objects dir, compute hash and size, ensure consistency.
-    Returns (hash, size, dest_path, replaced_flag).
+    Stream file -> encrypted object, compute hashes, and store by encrypted hash.
+    Returns (encryption_result, dest_path, replaced_flag).
     """
     objects_dir = get_objects_dir(storage_root)
     objects_dir.mkdir(parents=True, exist_ok=True)
 
     fd, tmp_name = tempfile.mkstemp(dir=objects_dir, prefix=".tmp-")
     tmp_path = Path(tmp_name)
-    h = hashlib.sha256()
-    size = 0
     try:
         with os.fdopen(fd, "wb") as f_dst, src.open("rb") as f_src:
-            while True:
-                chunk = f_src.read(chunk_size)
-                if not chunk:
-                    break
-                f_dst.write(chunk)
-                size += len(chunk)
-                h.update(chunk)
+            result = encrypt_stream(
+                f_src,
+                f_dst,
+                key=key,
+                aad=aad,
+                compression_level=compression_level,
+                compression_algo=compression_algo,
+                chunk_size=chunk_size,
+            )
             f_dst.flush()
             os.fsync(f_dst.fileno())
     except Exception:
         tmp_path.unlink(missing_ok=True)
         raise
 
-    obj_hash = h.hexdigest()
+    obj_hash = result.enc_hash_hex
     dest = objects_dir / obj_hash
 
     if dest.exists():
@@ -64,22 +72,24 @@ def store_file_object(storage_root: Path, src: Path,
             existing_hash = None
             existing_size = None
 
-        if existing_hash == obj_hash and existing_size == size:
+        if existing_hash == obj_hash and existing_size == result.enc_size:
             tmp_path.unlink(missing_ok=True)
-            return obj_hash, size, dest, False
+            return result, dest, False
         tmp_path.replace(dest)
-        return obj_hash, size, dest, True
+        return result, dest, True
 
     tmp_path.replace(dest)
-    return obj_hash, size, dest, True
+    return result, dest, True
 
 
-def verify_object(storage_root: Path, entry: dict,
-                  chunk_size: int = DEFAULT_CHUNK_SIZE) -> Tuple[str, str, int | None, str | None]:
-    obj_hash = entry.get("hash")
+def verify_object_hash(
+    storage_root: Path,
+    obj_hash: str,
+    expected_size: Optional[int] = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+) -> Tuple[str, str, int | None, str | None]:
     if not obj_hash:
-        return "corrupted", "missing hash in entry", None, None
-
+        return "corrupted", "missing object hash", None, None
     obj_path = get_objects_dir(storage_root) / obj_hash
     if not obj_path.exists():
         return "missing", f"object not found: {obj_path}", None, None
@@ -93,7 +103,6 @@ def verify_object(storage_root: Path, entry: dict,
     except OSError as exc:
         return "corrupted", f"cannot stat object {obj_path}: {exc}", None, None
 
-    expected_size = entry.get("size")
     size_mismatch = expected_size is not None and obj_stat.st_size != expected_size
 
     try:

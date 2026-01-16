@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
@@ -21,3 +22,12 @@ def mtime_to_iso(mtime: float) -> str:
 
 def normalize_original_path(path: Union[str, Path]) -> str:
     return str(Path(path).expanduser().resolve())
+
+
+def canonical_json_bytes(data: object) -> bytes:
+    return json.dumps(
+        data,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")

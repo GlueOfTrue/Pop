@@ -1,169 +1,684 @@
 from __future__ import annotations
 
+import io
+import json
+import platform
+import secrets
 import shutil
 import subprocess
 import tempfile
+import time
+from getpass import getpass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import List, Optional
 
 from . import init as storage_init
-from .index import load_index, save_index
-from .objects import (
-    get_objects_dir,
-    store_file_object,
-    verify_object,
+from .auth import require_local_auth
+from .crypto import ZSTD_AVAILABLE, decrypt_stream, derive_version_key, encrypt_stream, sha256_hex
+from .ecc import attempt_repair, compute_ecc
+from .index import load_catalog, save_catalog
+from .keystore import get_or_init_master_key, keystore_exists, unlock_keystore
+from .objects import get_objects_dir, store_encrypted_object, verify_object_hash
+from .paths import get_ecc_dir, get_record_path, get_storage_root
+from .totp import (
+    build_totp_uri,
+    clear_totp_config,
+    generate_totp_secret,
+    is_totp_configured,
+    load_totp_config,
+    save_totp_config,
+    verify_totp,
 )
-from .paths import get_storage_root
-from .util import DEFAULT_CHUNK_SIZE, mtime_to_iso, normalize_original_path, now_utc_iso
+from .util import canonical_json_bytes, normalize_original_path, now_utc_iso
+
+FAST_ZLIB_LEVEL = 1
+FAST_ZSTD_LEVEL = 3
+STRONG_ZSTD_LEVEL = 19
+LSOF_PATH = shutil.which("lsof")
+ECC_MAX_BYTES = 1024 * 1024 * 1024
+ECC_BLOCK_SIZE = 64 * 1024
+ECC_STRIPE_BLOCKS = 8
 
 
 def _resolve_root(storage_root: Optional[Path]) -> Path:
     return storage_root if storage_root is not None else get_storage_root()
 
 
-def init_storage(storage_root: Optional[Path] = None, verbose: bool = False) -> Path:
+def _public_meta(doc_id: str, name: str, version: int) -> dict:
+    return {"doc_id": doc_id, "name": name, "version": version}
+
+
+def _public_meta_bytes(doc_id: str, name: str, version: int) -> bytes:
+    return canonical_json_bytes(_public_meta(doc_id, name, version))
+
+
+def _require_auth(storage_root: Path, master_key: bytes, action: str) -> None:
+    if not require_local_auth(action):
+        raise PermissionError("authentication failed or canceled")
+    if is_totp_configured(storage_root):
+        cfg = load_totp_config(storage_root, master_key)
+        code = getpass("TOTP code: ")
+        if not verify_totp(code, cfg, skew=0):
+            raise PermissionError("invalid TOTP code")
+
+
+def _select_fast_compression() -> tuple[str, int]:
+    if ZSTD_AVAILABLE:
+        return "zstd", FAST_ZSTD_LEVEL
+    return "zlib", FAST_ZLIB_LEVEL
+
+
+def _maybe_build_ecc(storage_root: Path, obj_path: Path, enc_size: Optional[int]) -> Optional[dict]:
+    if enc_size is None or enc_size > ECC_MAX_BYTES:
+        return None
+    ecc_info = compute_ecc(
+        obj_path,
+        get_ecc_dir(storage_root),
+        block_size=ECC_BLOCK_SIZE,
+        stripe_blocks=ECC_STRIPE_BLOCKS,
+    )
+    return {
+        "enabled": True,
+        "version": 1,
+        "scheme": "xor-parity",
+        "block_size": ECC_BLOCK_SIZE,
+        "stripe_blocks": ECC_STRIPE_BLOCKS,
+        "parity": {
+            "hash": ecc_info["parity_hash"],
+            "size": ecc_info["parity_size"],
+        },
+        "block_hashes": ecc_info["block_hashes"],
+        "total_blocks": ecc_info["total_blocks"],
+    }
+
+
+def _attempt_ecc_repair(
+    storage_root: Path,
+    meta: dict,
+    enc_hash: str,
+    enc_size: Optional[int],
+) -> dict:
+    if not enc_hash:
+        return {"attempted": False, "repaired": False, "reason": "missing encrypted hash"}
+    ecc = meta.get("ecc")
+    if not isinstance(ecc, dict) or not ecc.get("enabled"):
+        return {"attempted": False, "repaired": False, "reason": "ecc not enabled"}
+    if enc_size is None:
+        return {"attempted": False, "repaired": False, "reason": "missing encrypted size"}
+    block_hashes = ecc.get("block_hashes")
+    if not isinstance(block_hashes, list):
+        return {"attempted": False, "repaired": False, "reason": "missing block hashes"}
+    parity = ecc.get("parity", {})
+    if not isinstance(parity, dict):
+        return {"attempted": False, "repaired": False, "reason": "missing parity metadata"}
+    parity_hash = parity.get("hash")
+    if not parity_hash:
+        return {"attempted": False, "repaired": False, "reason": "missing parity hash"}
+
+    block_size = ecc.get("block_size", ECC_BLOCK_SIZE)
+    stripe_blocks = ecc.get("stripe_blocks", ECC_STRIPE_BLOCKS)
+    try:
+        block_size = int(block_size)
+        stripe_blocks = int(stripe_blocks)
+    except (TypeError, ValueError):
+        return {"attempted": False, "repaired": False, "reason": "invalid ecc parameters"}
+
+    obj_path = get_objects_dir(storage_root) / enc_hash
+    parity_path = get_ecc_dir(storage_root) / parity_hash
+    result = attempt_repair(
+        obj_path=obj_path,
+        parity_path=parity_path,
+        expected_hash=enc_hash,
+        parity_hash=parity_hash,
+        block_hashes=block_hashes,
+        block_size=block_size,
+        stripe_blocks=stripe_blocks,
+        total_size=enc_size,
+    )
+    result["attempted"] = True
+    return result
+
+
+def init_storage(storage_root: Optional[Path] = None, master_password: Optional[str] = None,
+                 verbose: bool = False) -> Path:
     root = _resolve_root(storage_root)
     storage_init.init_storage(root, verbose=verbose)
+    if master_password is None:
+        if not keystore_exists(root):
+            raise ValueError("master password required to initialize keystore")
+        return root
+    get_or_init_master_key(root, master_password)
     return root
 
 
-def add_file(storage_root: Optional[Path], file_path: Path) -> dict:
+def unlock_storage(storage_root: Optional[Path], master_password: str) -> bytes:
+    root = _resolve_root(storage_root)
+    return unlock_keystore(root, master_password)
+
+
+def totp_is_configured(storage_root: Optional[Path]) -> bool:
+    root = _resolve_root(storage_root)
+    return is_totp_configured(root)
+
+
+def get_totp_info(storage_root: Optional[Path], master_key: bytes) -> dict:
+    root = _resolve_root(storage_root)
+    _require_auth(root, master_key, "read TOTP config")
+    cfg = load_totp_config(root, master_key)
+    return {
+        "issuer": cfg.issuer,
+        "label": cfg.label,
+        "digits": cfg.digits,
+        "period": cfg.period,
+        "algorithm": cfg.algorithm,
+    }
+
+
+def configure_totp(
+    storage_root: Optional[Path],
+    master_key: bytes,
+    secret_b32: Optional[str],
+    label: Optional[str],
+    issuer: Optional[str] = None,
+    digits: Optional[int] = None,
+    period: Optional[int] = None,
+    algorithm: Optional[str] = None,
+) -> dict:
+    root = _resolve_root(storage_root)
+    _require_auth(root, master_key, "configure TOTP")
+
+    generated = False
+    if secret_b32 is None or not secret_b32.strip():
+        secret_b32 = generate_totp_secret()
+        generated = True
+
+    label = (label or "gs-backup").strip()
+
+    kwargs: dict = {}
+    if issuer is not None and issuer.strip():
+        kwargs["issuer"] = issuer.strip()
+    if digits is not None:
+        kwargs["digits"] = int(digits)
+    if period is not None:
+        kwargs["period"] = int(period)
+    if algorithm is not None and algorithm.strip():
+        kwargs["algorithm"] = algorithm.strip().upper()
+
+    cfg = save_totp_config(root, master_key, secret_b32, label, **kwargs)
+    uri = build_totp_uri(cfg)
+    return {
+        "configured": True,
+        "generated": generated,
+        "secret_b32": cfg.secret_b32,
+        "issuer": cfg.issuer,
+        "label": cfg.label,
+        "digits": cfg.digits,
+        "period": cfg.period,
+        "algorithm": cfg.algorithm,
+        "otpauth_uri": uri,
+    }
+
+
+def clear_totp(storage_root: Optional[Path], master_key: bytes) -> None:
+    root = _resolve_root(storage_root)
+    _require_auth(root, master_key, "disable TOTP")
+    clear_totp_config(root)
+
+
+def list_public(storage_root: Optional[Path]) -> dict:
+    root = _resolve_root(storage_root)
+    catalog = load_catalog(root)
+    docs = catalog.get("docs", {})
+    if not isinstance(docs, dict):
+        raise ValueError("catalog format invalid: 'docs' must be an object")
+    result = {}
+    for doc_id, doc in docs.items():
+        if not isinstance(doc, dict):
+            continue
+        name = doc.get("name")
+        versions = doc.get("versions", [])
+        if not isinstance(versions, list):
+            continue
+        result[doc_id] = {"name": name, "versions": list(versions)}
+    return {"docs": result}
+
+
+def add_file(
+    storage_root: Optional[Path],
+    master_key: bytes,
+    file_path: Path,
+    doc_name: Optional[str] = None,
+    mode: str = "backup",
+) -> dict:
+    if mode not in ("backup", "secure"):
+        raise ValueError("mode must be 'backup' or 'secure'")
+
     root = _resolve_root(storage_root)
     file_path = Path(file_path)
     if not file_path.exists():
         raise FileNotFoundError(file_path)
     if not file_path.is_file():
-        raise ValueError(f"Path is not a file: {file_path}")
+        raise ValueError(f"path is not a file: {file_path}")
 
     abs_path = file_path.resolve()
-    obj_hash, size, _, _replaced = store_file_object(root, abs_path)
+    doc_name = doc_name or file_path.name
 
-    index = load_index(root)
-    files = index.setdefault("files", {})
-    versions = files.setdefault(str(abs_path), [])
+    catalog = load_catalog(root)
+    docs = catalog.get("docs", {})
+    if not isinstance(docs, dict):
+        raise ValueError("catalog format invalid: 'docs' must be an object")
 
-    entry = {
-        "hash": obj_hash,
-        "size": size,
-        "mtime": mtime_to_iso(abs_path.stat().st_mtime),
-        "stored_at": now_utc_iso(),
-        "rel_path": str(file_path),
-        "plain_hash": None,
-        "enc_hash": None,
-        "encryption_scheme_version": None,
-    }
-    versions.append(entry)
-    save_index(root, index)
-    return entry
+    doc_id = None
+    for existing_id, doc in docs.items():
+        if isinstance(doc, dict) and doc.get("name") == doc_name:
+            doc_id = existing_id
+            break
 
+    is_new_doc = False
+    if doc_id is None:
+        doc_id = secrets.token_hex(16)
+        docs[doc_id] = {"name": doc_name, "versions": []}
+        is_new_doc = True
 
-def list_files(storage_root: Optional[Path]) -> dict:
-    root = _resolve_root(storage_root)
-    return load_index(root)
-
-
-def verify_storage(storage_root: Optional[Path],
-                   target_paths: Optional[Iterable[str]] = None) -> dict:
-    root = _resolve_root(storage_root)
-    index = load_index(root)
-    files = index.get("files", {})
-    if not isinstance(files, dict):
-        raise ValueError("index format invalid: 'files' must be an object")
-
-    targets = {normalize_original_path(p) for p in target_paths} if target_paths else set()
-
-    summary = {"OK": 0, "MISSING": 0, "CORRUPTED": 0}
-    results: List[dict] = []
-    processed_any = False
-    index_changed = False
-
-    for original_path, versions in files.items():
-        if targets and original_path not in targets:
-            continue
-
-        processed_any = True
-
-        if not isinstance(versions, list) or not versions:
-            summary["CORRUPTED"] += 1
-            results.append({"path": original_path, "status": "CORRUPTED",
-                            "reasons": ["invalid or empty versions list"]})
-            continue
-
-        missing = False
-        corrupted = False
-        reasons: List[str] = []
-        for idx, entry in enumerate(versions, start=1):
-            status, reason, actual_size, actual_hash = verify_object(root, entry)
-
-            if status == "corrupted" and reason.startswith("size mismatch") and actual_hash == entry.get("hash"):
-                if actual_size is not None:
-                    entry["size"] = actual_size
-                    status = "ok"
-                    reason = f"fixed size metadata to {actual_size}"
-                    reasons.append(f"v{idx}: {reason}")
-                    index_changed = True
-                    continue
-
-            if status == "missing":
-                missing = True
-            elif status == "corrupted":
-                corrupted = True
-            if status != "ok" and reason:
-                reasons.append(f"v{idx}: {reason}")
-
-        if missing:
-            status = "MISSING"
-            summary["MISSING"] += 1
-        elif corrupted:
-            status = "CORRUPTED"
-            summary["CORRUPTED"] += 1
-        else:
-            status = "OK"
-            summary["OK"] += 1
-
-        results.append({"path": original_path, "status": status, "reasons": reasons})
-
-    if targets:
-        missing_targets = targets - set(files.keys())
-        for path in missing_targets:
-            summary["MISSING"] += 1
-            results.append({"path": path, "status": "MISSING", "reasons": ["not in index"]})
-
-    if not processed_any and targets:
-        summary["MISSING"] = max(summary["MISSING"], 1)
-
-    if index_changed:
-        save_index(root, index)
-
-    return {"summary": summary, "results": results, "index_updated": index_changed}
-
-
-def restore_file(storage_root: Optional[Path], source_path: str, dest_path: Path,
-                 version: Optional[int] = None, force: bool = False) -> dict:
-    root = _resolve_root(storage_root)
-    index = load_index(root)
-
-    files = index.get("files", {})
-    if not isinstance(files, dict):
-        raise ValueError("index format invalid: 'files' must be an object")
-    if not files:
-        raise FileNotFoundError("storage is empty")
-
-    original_path = normalize_original_path(source_path)
-    versions = files.get(original_path)
-    if not versions:
-        raise FileNotFoundError(f"not found in index: {original_path}")
+    versions = docs[doc_id].get("versions", [])
     if not isinstance(versions, list):
-        raise ValueError(f"index entry for {original_path} is invalid")
+        raise ValueError("catalog format invalid: 'versions' must be a list")
+    version = len(versions) + 1
 
-    version_idx = version if version is not None else len(versions)
-    if version_idx < 1 or version_idx > len(versions):
-        raise ValueError(f"version must be between 1 and {len(versions)}")
+    pub_bytes = _public_meta_bytes(doc_id, doc_name, version)
+    pub_hash = sha256_hex(pub_bytes)
 
-    entry = versions[version_idx - 1]
-    status, reason, _actual_size, _actual_hash = verify_object(root, entry)
+    content_key = derive_version_key(master_key, doc_id, version, "content")
+    meta_key = derive_version_key(master_key, doc_id, version, "meta")
+
+    compression_algo, compression_level = _select_fast_compression()
+    enc_result, obj_path, _replaced = store_encrypted_object(
+        root,
+        abs_path,
+        key=content_key,
+        aad=pub_bytes,
+        compression_level=compression_level,
+        compression_algo=compression_algo,
+    )
+
+    ecc = _maybe_build_ecc(root, obj_path, enc_result.enc_size)
+
+    meta_core = {
+        "doc_id": doc_id,
+        "version": version,
+        "source_path": normalize_original_path(abs_path),
+        "mode": mode,
+        "created_at": now_utc_iso(),
+        "public_hash": pub_hash,
+        "content": {
+            "plain_hash": enc_result.plain_hash_hex,
+            "plain_size": enc_result.plain_size,
+            "enc_hash": enc_result.enc_hash_hex,
+            "enc_size": enc_result.enc_size,
+            "compressed": enc_result.compressed,
+            "compressed_size": enc_result.compressed_size,
+            "compression": {
+                "algo": enc_result.compression_algo,
+                "level": enc_result.compression_level,
+            },
+        },
+    }
+    if ecc is not None:
+        meta_core["ecc"] = ecc
+    meta_plain_hash = sha256_hex(canonical_json_bytes(meta_core))
+    meta = dict(meta_core)
+    meta["meta_plain_hash"] = meta_plain_hash
+
+    record_path = get_record_path(root, doc_id, version)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    with record_path.open("wb") as record_file:
+        encrypt_stream(
+            io.BytesIO(canonical_json_bytes(meta)),
+            record_file,
+            key=meta_key,
+            aad=pub_bytes,
+            compression_level=None,
+        )
+
+    versions.append(version)
+    catalog["docs"] = docs
+    save_catalog(root, catalog)
+
+    if mode == "secure":
+        abs_path.unlink(missing_ok=False)
+
+    return {
+        "doc_id": doc_id,
+        "name": doc_name,
+        "version": version,
+        "public_hash": pub_hash,
+        "content_enc_hash": enc_result.enc_hash_hex,
+    }
+
+
+def _load_record(
+    storage_root: Path,
+    master_key: bytes,
+    doc_id: str,
+    name: str,
+    version: int,
+) -> dict:
+    pub_bytes = _public_meta_bytes(doc_id, name, version)
+    meta_key = derive_version_key(master_key, doc_id, version, "meta")
+    record_path = get_record_path(storage_root, doc_id, version)
+    if not record_path.exists():
+        raise FileNotFoundError(f"record not found: {record_path}")
+
+    out = io.BytesIO()
+    with record_path.open("rb") as record_file:
+        decrypt_stream(record_file, out, key=meta_key, aad=pub_bytes)
+    meta = json.loads(out.getvalue().decode("utf-8"))
+
+    stored_hash = meta.get("meta_plain_hash")
+    core = dict(meta)
+    core.pop("meta_plain_hash", None)
+    if sha256_hex(canonical_json_bytes(core)) != stored_hash:
+        raise ValueError("metadata hash mismatch")
+
+    if meta.get("public_hash") != sha256_hex(pub_bytes):
+        raise ValueError("public metadata hash mismatch")
+
+    return meta
+
+
+def get_metadata(
+    storage_root: Optional[Path],
+    master_key: bytes,
+    doc_name: str,
+    version: Optional[int] = None,
+) -> dict:
+    root = _resolve_root(storage_root)
+    catalog = load_catalog(root)
+    docs = catalog.get("docs", {})
+    if not isinstance(docs, dict):
+        raise ValueError("catalog format invalid: 'docs' must be an object")
+
+    doc_id = None
+    doc = None
+    for existing_id, entry in docs.items():
+        if isinstance(entry, dict) and entry.get("name") == doc_name:
+            doc_id = existing_id
+            doc = entry
+            break
+    if doc_id is None or doc is None:
+        raise FileNotFoundError(f"document not found: {doc_name}")
+
+    versions = doc.get("versions", [])
+    if not isinstance(versions, list) or not versions:
+        raise RuntimeError("document has no versions")
+
+    version_idx = version if version is not None else versions[-1]
+    if version_idx not in versions:
+        raise ValueError(f"version not found: {version_idx}")
+
+    _require_auth(root, master_key, "access hidden metadata")
+    return _load_record(root, master_key, doc_id, doc_name, version_idx)
+
+
+def verify_storage(
+    storage_root: Optional[Path],
+    master_key: bytes,
+    deep: bool = False,
+) -> dict:
+    root = _resolve_root(storage_root)
+    catalog = load_catalog(root)
+    docs = catalog.get("docs", {})
+    if not isinstance(docs, dict):
+        raise ValueError("catalog format invalid: 'docs' must be an object")
+
+    _require_auth(root, master_key, "verify storage")
+    results: List[dict] = []
+    summary = {"OK": 0, "CORRUPTED": 0, "MISSING": 0}
+
+    for doc_id, doc in docs.items():
+        if not isinstance(doc, dict):
+            continue
+        name = doc.get("name", doc_id)
+        versions = doc.get("versions", [])
+        if not isinstance(versions, list) or not versions:
+            continue
+
+        for version in versions:
+            try:
+                meta = _load_record(root, master_key, doc_id, name, version)
+                content = meta.get("content", {})
+                enc_hash = content.get("enc_hash")
+                enc_size = content.get("enc_size")
+                status, reason, _size, _hash = verify_object_hash(
+                    root,
+                    enc_hash,
+                    expected_size=enc_size,
+                )
+                repaired = False
+                reasons: List[str] = []
+                if status != "ok":
+                    reasons.append(reason)
+                    if status == "corrupted":
+                        ecc_result = _attempt_ecc_repair(root, meta, enc_hash, enc_size)
+                        if ecc_result.get("attempted"):
+                            if ecc_result.get("repaired"):
+                                status, reason, _size, _hash = verify_object_hash(
+                                    root,
+                                    enc_hash,
+                                    expected_size=enc_size,
+                                )
+                                if status == "ok":
+                                    repaired = True
+                                else:
+                                    reasons.append(reason)
+                            else:
+                                reasons.append(f"ecc: {ecc_result.get('reason')}")
+                    if status != "ok":
+                        summary[status.upper()] += 1
+                        results.append({
+                            "doc": name,
+                            "version": version,
+                            "status": status.upper(),
+                            "reasons": reasons,
+                        })
+                        continue
+                if deep:
+                    _ = _decrypt_content_to_sink(root, master_key, doc_id, name, version, meta)
+                summary["OK"] += 1
+                results.append({
+                    "doc": name,
+                    "version": version,
+                    "status": "OK",
+                    "reasons": ["repaired via ecc"] if repaired else [],
+                })
+            except FileNotFoundError as exc:
+                summary["MISSING"] += 1
+                results.append({
+                    "doc": name,
+                    "version": version,
+                    "status": "MISSING",
+                    "reasons": [str(exc)],
+                })
+            except Exception as exc:  # noqa: BLE001
+                summary["CORRUPTED"] += 1
+                results.append({
+                    "doc": name,
+                    "version": version,
+                    "status": "CORRUPTED",
+                    "reasons": [str(exc)],
+                })
+
+    return {"summary": summary, "results": results}
+
+
+def _decrypt_content_to_sink(
+    storage_root: Path,
+    master_key: bytes,
+    doc_id: str,
+    name: str,
+    version: int,
+    meta: dict,
+    out_stream: Optional[io.BufferedWriter] = None,
+) -> dict:
+    content = meta.get("content", {})
+    enc_hash = content.get("enc_hash")
+    enc_size = content.get("enc_size")
+    if not enc_hash:
+        raise ValueError("metadata missing content.enc_hash")
+
+    status, reason, _size, _hash = verify_object_hash(
+        storage_root,
+        enc_hash,
+        expected_size=enc_size,
+    )
     if status != "ok":
-        raise RuntimeError(f"object failed verification: {reason}")
+        if status == "corrupted":
+            ecc_result = _attempt_ecc_repair(storage_root, meta, enc_hash, enc_size)
+            if ecc_result.get("repaired"):
+                status, reason, _size, _hash = verify_object_hash(
+                    storage_root,
+                    enc_hash,
+                    expected_size=enc_size,
+                )
+        if status != "ok":
+            if status == "missing":
+                raise FileNotFoundError(
+                    f"object not found: {get_objects_dir(storage_root) / enc_hash}"
+                )
+            raise ValueError(f"encrypted object corrupted: {reason}")
+
+    obj_path = get_objects_dir(storage_root) / enc_hash
+
+    pub_bytes = _public_meta_bytes(doc_id, name, version)
+    content_key = derive_version_key(master_key, doc_id, version, "content")
+
+    if out_stream is None:
+        out_stream = io.BytesIO()
+
+    with obj_path.open("rb") as src:
+        result = decrypt_stream(src, out_stream, key=content_key, aad=pub_bytes)
+
+    expected_hash = content.get("plain_hash")
+    expected_size = content.get("plain_size")
+    if expected_hash and result.plain_hash_hex != expected_hash:
+        raise ValueError("content hash mismatch")
+    if expected_size is not None and result.plain_size != expected_size:
+        raise ValueError("content size mismatch")
+
+    return {"plain_hash": result.plain_hash_hex, "plain_size": result.plain_size}
+
+
+def _wait_for_file_open(path: Path, timeout: float = 5.0, interval: float = 0.2) -> bool:
+    if not LSOF_PATH or not Path(LSOF_PATH).exists():
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        proc = subprocess.run(
+            [LSOF_PATH, "-t", str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return True
+        if proc.returncode not in (0, 1):
+            break
+        time.sleep(interval)
+    return False
+
+
+def _wait_for_file_open_pids(
+    path: Path, timeout: float = 5.0, interval: float = 0.2
+) -> list[int]:
+    if not LSOF_PATH or not Path(LSOF_PATH).exists():
+        return []
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        proc = subprocess.run(
+            [LSOF_PATH, "-t", str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            pids = [int(line) for line in proc.stdout.splitlines() if line.strip().isdigit()]
+            if pids:
+                return pids
+        elif proc.returncode not in (0, 1):
+            break
+        time.sleep(interval)
+    return []
+
+
+def _pid_start_time(pid: int) -> Optional[str]:
+    proc = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "lstart="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    value = proc.stdout.strip()
+    return value if value else None
+
+
+def _wait_for_file_close(path: Path, interval: float = 0.5) -> bool:
+    if not LSOF_PATH or not Path(LSOF_PATH).exists():
+        return False
+    while True:
+        proc = subprocess.run(
+            [LSOF_PATH, "-t", str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 1 or not proc.stdout.strip():
+            return True
+        if proc.returncode not in (0, 1):
+            return False
+        time.sleep(interval)
+
+
+def restore_file(
+    storage_root: Optional[Path],
+    master_key: bytes,
+    doc_name: str,
+    dest_path: Optional[Path],
+    version: Optional[int] = None,
+    force: bool = False,
+) -> dict:
+    root = _resolve_root(storage_root)
+    catalog = load_catalog(root)
+    docs = catalog.get("docs", {})
+    if not isinstance(docs, dict):
+        raise ValueError("catalog format invalid: 'docs' must be an object")
+
+    doc_id = None
+    doc = None
+    for existing_id, entry in docs.items():
+        if isinstance(entry, dict) and entry.get("name") == doc_name:
+            doc_id = existing_id
+            doc = entry
+            break
+    if doc_id is None or doc is None:
+        raise FileNotFoundError(f"document not found: {doc_name}")
+
+    versions = doc.get("versions", [])
+    if not isinstance(versions, list) or not versions:
+        raise RuntimeError("document has no versions")
+
+    version_idx = version if version is not None else versions[-1]
+    if version_idx not in versions:
+        raise ValueError(f"version not found: {version_idx}")
+
+    _require_auth(root, master_key, "restore file")
+    meta = _load_record(root, master_key, doc_id, doc_name, version_idx)
+
+    if dest_path is None:
+        dest_path = meta.get("source_path")
+        if not dest_path:
+            raise ValueError("metadata missing source_path for restore")
 
     dest = Path(dest_path).expanduser().absolute()
     if dest.exists():
@@ -178,171 +693,352 @@ def restore_file(storage_root: Optional[Path], source_path: str, dest_path: Path
     else:
         dest.parent.mkdir(parents=True, exist_ok=True)
 
-    obj_path = get_objects_dir(root) / entry["hash"]
-    with obj_path.open("rb") as src, dest.open("wb") as dst:
-        shutil.copyfileobj(src, dst, length=DEFAULT_CHUNK_SIZE)
+    with dest.open("wb") as out:
+        _decrypt_content_to_sink(root, master_key, doc_id, doc_name, version_idx, meta, out_stream=out)
 
-    return {"restored_from": original_path, "version": version_idx, "destination": str(dest)}
+    return {"doc": doc_name, "version": version_idx, "destination": str(dest)}
 
 
-def open_file(storage_root: Optional[Path], source_path: str,
-              version: Optional[int] = None, force: bool = False) -> dict:
-    """
-    Restore a version into a temp file and launch it with the default macOS app.
-    """
+def open_file(
+    storage_root: Optional[Path],
+    master_key: bytes,
+    doc_name: str,
+    version: Optional[int] = None,
+    force: bool = False,
+    paranoid: bool = False,
+) -> dict:
     root = _resolve_root(storage_root)
-    index = load_index(root)
+    catalog = load_catalog(root)
+    docs = catalog.get("docs", {})
+    if not isinstance(docs, dict):
+        raise ValueError("catalog format invalid: 'docs' must be an object")
 
-    files = index.get("files", {})
-    if not isinstance(files, dict):
-        raise ValueError("index format invalid: 'files' must be an object")
-    if not files:
-        raise FileNotFoundError("storage is empty")
+    doc_id = None
+    doc = None
+    for existing_id, entry in docs.items():
+        if isinstance(entry, dict) and entry.get("name") == doc_name:
+            doc_id = existing_id
+            doc = entry
+            break
+    if doc_id is None or doc is None:
+        raise FileNotFoundError(f"document not found: {doc_name}")
 
-    original_path = normalize_original_path(source_path)
-    versions = files.get(original_path)
-    if not versions:
-        raise FileNotFoundError(f"not found in index: {original_path}")
-    if not isinstance(versions, list):
-        raise ValueError(f"index entry for {original_path} is invalid")
+    versions = doc.get("versions", [])
+    if not isinstance(versions, list) or not versions:
+        raise RuntimeError("document has no versions")
 
-    version_idx = version if version is not None else len(versions)
-    if version_idx < 1 or version_idx > len(versions):
-        raise ValueError(f"version must be between 1 and {len(versions)}")
+    version_idx = version if version is not None else versions[-1]
+    if version_idx not in versions:
+        raise ValueError(f"version not found: {version_idx}")
 
-    entry = versions[version_idx - 1]
-    status, reason, _actual_size, _actual_hash = verify_object(root, entry)
-    if status != "ok" and not force:
-        raise RuntimeError(f"object failed verification: {reason}")
+    _require_auth(root, master_key, "open file")
+    meta = _load_record(root, master_key, doc_id, doc_name, version_idx)
 
     tmpdir = Path(tempfile.mkdtemp(prefix="gs-backup-open-"))
-    basename = Path(original_path).name or entry["hash"]
+    basename = doc_name or f"{doc_id}-{version_idx}"
     dest = tmpdir / basename
 
-    obj_path = get_objects_dir(root) / entry["hash"]
-    with obj_path.open("rb") as src, dest.open("wb") as dst:
-        shutil.copyfileobj(src, dst, length=DEFAULT_CHUNK_SIZE)
+    with dest.open("wb") as out:
+        _decrypt_content_to_sink(root, master_key, doc_id, doc_name, version_idx, meta, out_stream=out)
 
     try:
-        proc = subprocess.run(["open", str(dest)], check=False)
+        system = platform.system()
+        if system == "Darwin":
+            open_args = ["open", str(dest)] if paranoid else ["open", "-W", str(dest)]
+        elif system == "Linux":
+            opener = shutil.which("xdg-open") or shutil.which("gio")
+            if not opener:
+                raise RuntimeError("no opener found (xdg-open/gio)")
+            open_args = ["gio", "open", str(dest)] if Path(opener).name == "gio" else [opener, str(dest)]
+        else:
+            raise RuntimeError(f"unsupported platform: {system}")
+        proc = subprocess.run(open_args, check=False)
         launched = proc.returncode == 0
-        return {
-            "path": str(dest),
-            "version": version_idx,
-            "launched": launched,
-            "returncode": proc.returncode,
-            "tempdir": str(tmpdir),
-            "verification": status,
-            "verification_reason": reason,
-        }
     except FileNotFoundError as exc:
-        raise RuntimeError("macOS 'open' command not found") from exc
+        raise RuntimeError("viewer command not found") from exc
 
-
-def get_stats(storage_root: Optional[Path]) -> dict:
-    root = _resolve_root(storage_root)
-    index = load_index(root)
-
-    files = index.get("files", {})
-    if not isinstance(files, dict):
-        raise ValueError("index format invalid: 'files' must be an object")
-
-    objects_dir = get_objects_dir(root)
-    if objects_dir.is_symlink():
-        raise RuntimeError(f"objects directory is a symlink: {objects_dir}")
-
-    referenced_hashes: set[str] = set()
-    versions_count = 0
-    invalid_entries = 0
-    for versions in files.values():
-        if not isinstance(versions, list):
-            invalid_entries += 1
-            continue
-        versions_count += len(versions)
-        for entry in versions:
-            h = entry.get("hash")
-            if isinstance(h, str):
-                referenced_hashes.add(h)
-
-    objects_count = 0
-    objects_total_size = 0
-    largest_object = (None, 0)
-
-    if objects_dir.exists() and objects_dir.is_dir():
-        for obj in objects_dir.iterdir():
-            if not obj.is_file():
-                continue
+    cleaned = False
+    unlinked = False
+    opened = False
+    viewer_pids: list[dict] = []
+    system = platform.system()
+    if paranoid and launched:
+        pid_list = _wait_for_file_open_pids(dest)
+        opened = bool(pid_list)
+        viewer_pids = [{"pid": pid, "start": _pid_start_time(pid)} for pid in pid_list]
+        if opened:
             try:
-                size = obj.stat().st_size
+                dest.unlink()
+                unlinked = True
             except OSError:
-                continue
-            objects_count += 1
-            objects_total_size += size
-            if size > largest_object[1]:
-                largest_object = (obj.name, size)
+                unlinked = False
+        if unlinked:
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                cleaned = True
+            except OSError:
+                cleaned = False
+    elif paranoid:
+        try:
+            dest.unlink()
+            unlinked = True
+        except OSError:
+            unlinked = False
+    elif system == "Linux":
+        pid_list = _wait_for_file_open_pids(dest)
+        opened = bool(pid_list)
+        viewer_pids = [{"pid": pid, "start": _pid_start_time(pid)} for pid in pid_list]
+        if opened:
+            closed = _wait_for_file_close(dest)
+            if closed:
+                try:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+                    cleaned = True
+                except OSError:
+                    cleaned = False
+                viewer_pids = []
     else:
-        objects_dir = None
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            cleaned = True
+        except OSError:
+            cleaned = False
 
-    avg_size = objects_total_size / objects_count if objects_count else 0
-    duplication = (versions_count / len(referenced_hashes)) if referenced_hashes else 0
+    if not launched and not force:
+        raise RuntimeError(f"failed to launch viewer (exit {proc.returncode})")
 
     return {
-        "source_paths": len(files),
-        "versions_total": versions_count,
-        "invalid_entries": invalid_entries,
-        "unique_objects": len(referenced_hashes),
-        "objects_on_disk": objects_count,
-        "objects_dir_size": objects_total_size,
-        "largest_object": largest_object,
-        "avg_size": avg_size,
-        "duplication_ratio": duplication,
-        "objects_dir_exists": objects_dir is not None,
+        "doc": doc_name,
+        "version": version_idx,
+        "path": str(dest),
+        "launched": launched,
+        "returncode": proc.returncode,
+        "tempdir": str(tmpdir),
+        "cleaned": cleaned,
+        "unlinked": unlinked,
+        "opened": opened,
+        "viewer_pids": viewer_pids,
     }
 
 
-def prune_objects(storage_root: Optional[Path]) -> dict:
+def get_stats(storage_root: Optional[Path], master_key: bytes) -> dict:
     root = _resolve_root(storage_root)
-    index = load_index(root)
+    catalog = load_catalog(root)
+    docs = catalog.get("docs", {})
+    if not isinstance(docs, dict):
+        raise ValueError("catalog format invalid: 'docs' must be an object")
 
-    files = index.get("files", {})
-    if not isinstance(files, dict):
-        raise ValueError("index format invalid: 'files' must be an object")
+    _require_auth(root, master_key, "read storage stats")
 
-    referenced_hashes: set[str] = set()
-    for versions in files.values():
-        if not isinstance(versions, list):
+    doc_count = 0
+    version_count = 0
+    referenced_hashes = set()
+    referenced_parity = set()
+
+    for doc_id, doc in docs.items():
+        if not isinstance(doc, dict):
             continue
-        for entry in versions:
-            h = entry.get("hash")
-            if isinstance(h, str):
-                referenced_hashes.add(h)
+        name = doc.get("name", doc_id)
+        versions = doc.get("versions", [])
+        if not isinstance(versions, list) or not versions:
+            continue
+        doc_count += 1
+        for version in versions:
+            meta = _load_record(root, master_key, doc_id, name, version)
+            content = meta.get("content", {})
+            enc_hash = content.get("enc_hash")
+            if enc_hash:
+                referenced_hashes.add(enc_hash)
+            ecc = meta.get("ecc")
+            if isinstance(ecc, dict) and ecc.get("enabled"):
+                parity = ecc.get("parity", {})
+                if isinstance(parity, dict):
+                    parity_hash = parity.get("hash")
+                    if parity_hash:
+                        referenced_parity.add(parity_hash)
+            version_count += 1
 
     objects_dir = get_objects_dir(root)
-    if not objects_dir.exists():
-        return {"removed": 0, "failed": 0, "skipped_symlinks": 0}
-    if objects_dir.is_symlink():
-        raise RuntimeError(f"objects directory is a symlink: {objects_dir}")
-    if not objects_dir.is_dir():
-        raise RuntimeError(f"objects path is not a directory: {objects_dir}")
+    objects = []
+    if objects_dir.exists():
+        for obj in objects_dir.iterdir():
+            if obj.is_file() and not obj.is_symlink():
+                objects.append(obj)
 
-    unreferenced: List[Path] = []
-    for obj in objects_dir.iterdir():
-        if not obj.is_file():
+    total_size = sum(p.stat().st_size for p in objects)
+    ecc_dir = get_ecc_dir(root)
+    ecc_objects = []
+    if ecc_dir.exists():
+        for obj in ecc_dir.iterdir():
+            if obj.is_file() and not obj.is_symlink():
+                ecc_objects.append(obj)
+    ecc_total_size = sum(p.stat().st_size for p in ecc_objects)
+    return {
+        "documents": doc_count,
+        "versions_total": version_count,
+        "unique_objects": len(referenced_hashes),
+        "objects_on_disk": len(objects),
+        "objects_dir_size": total_size,
+        "ecc_unique": len(referenced_parity),
+        "ecc_objects_on_disk": len(ecc_objects),
+        "ecc_dir_size": ecc_total_size,
+    }
+
+
+def prune_objects(storage_root: Optional[Path], master_key: bytes) -> dict:
+    root = _resolve_root(storage_root)
+    catalog = load_catalog(root)
+    docs = catalog.get("docs", {})
+    if not isinstance(docs, dict):
+        raise ValueError("catalog format invalid: 'docs' must be an object")
+
+    _require_auth(root, master_key, "prune storage")
+
+    referenced_hashes = set()
+    referenced_parity = set()
+    removed_versions = 0
+    removed_records = 0
+    removed_docs = 0
+    removed_record_dirs = 0
+    repaired_versions = 0
+
+    for doc_id, doc in list(docs.items()):
+        if not isinstance(doc, dict):
             continue
-        if obj.name not in referenced_hashes:
-            unreferenced.append(obj)
+        name = doc.get("name", doc_id)
+        versions = doc.get("versions", [])
+        if not isinstance(versions, list):
+            continue
 
+        kept_versions: List[int] = []
+        for version in versions:
+            record_path = get_record_path(root, doc_id, version)
+            try:
+                meta = _load_record(root, master_key, doc_id, name, version)
+            except FileNotFoundError:
+                removed_versions += 1
+                if record_path.exists():
+                    try:
+                        record_path.unlink()
+                        removed_records += 1
+                    except OSError:
+                        pass
+                continue
+            except Exception:
+                removed_versions += 1
+                if record_path.exists():
+                    try:
+                        record_path.unlink()
+                        removed_records += 1
+                    except OSError:
+                        pass
+                continue
+
+            content = meta.get("content", {})
+            enc_hash = content.get("enc_hash")
+            enc_size = content.get("enc_size")
+            if not enc_hash:
+                removed_versions += 1
+                try:
+                    record_path.unlink()
+                    removed_records += 1
+                except OSError:
+                    pass
+                continue
+
+            status, _reason, _size, _hash = verify_object_hash(
+                root,
+                enc_hash,
+                expected_size=enc_size,
+            )
+            if status != "ok":
+                if status == "corrupted":
+                    ecc_result = _attempt_ecc_repair(root, meta, enc_hash, enc_size)
+                    if ecc_result.get("repaired"):
+                        status, _reason, _size, _hash = verify_object_hash(
+                            root,
+                            enc_hash,
+                            expected_size=enc_size,
+                        )
+                        if status == "ok":
+                            repaired_versions += 1
+                if status != "ok":
+                    removed_versions += 1
+                    try:
+                        record_path.unlink()
+                        removed_records += 1
+                    except OSError:
+                        pass
+                    continue
+
+            kept_versions.append(version)
+            referenced_hashes.add(enc_hash)
+            ecc = meta.get("ecc")
+            if isinstance(ecc, dict) and ecc.get("enabled"):
+                parity = ecc.get("parity", {})
+                if isinstance(parity, dict):
+                    parity_hash = parity.get("hash")
+                    if parity_hash:
+                        referenced_parity.add(parity_hash)
+
+        if kept_versions:
+            doc["versions"] = kept_versions
+        else:
+            removed_docs += 1
+            docs.pop(doc_id, None)
+            record_dir = get_record_path(root, doc_id, 1).parent
+            try:
+                record_dir.rmdir()
+                removed_record_dirs += 1
+            except OSError:
+                pass
+
+    if removed_versions or removed_docs:
+        catalog["docs"] = docs
+        save_catalog(root, catalog)
+
+    objects_dir = get_objects_dir(root)
     removed = 0
     failed = 0
     skipped_symlinks = 0
-    for obj_path in unreferenced:
-        if obj_path.is_symlink():
-            skipped_symlinks += 1
-            continue
-        try:
-            obj_path.unlink()
-            removed += 1
-        except OSError:
-            failed += 1
+    if objects_dir.exists():
+        for obj in objects_dir.iterdir():
+            if obj.is_symlink():
+                skipped_symlinks += 1
+                continue
+            if obj.is_file() and obj.name not in referenced_hashes:
+                try:
+                    obj.unlink()
+                    removed += 1
+                except OSError:
+                    failed += 1
 
-    return {"removed": removed, "failed": failed, "skipped_symlinks": skipped_symlinks}
+    ecc_dir = get_ecc_dir(root)
+    ecc_removed = 0
+    ecc_failed = 0
+    ecc_skipped_symlinks = 0
+    if ecc_dir.exists():
+        for obj in ecc_dir.iterdir():
+            if obj.is_symlink():
+                ecc_skipped_symlinks += 1
+                continue
+            if obj.is_file() and obj.name not in referenced_parity:
+                try:
+                    obj.unlink()
+                    ecc_removed += 1
+                except OSError:
+                    ecc_failed += 1
+
+    return {
+        "removed": removed,
+        "failed": failed,
+        "skipped_symlinks": skipped_symlinks,
+        "versions_removed": removed_versions,
+        "records_removed": removed_records,
+        "docs_removed": removed_docs,
+        "record_dirs_removed": removed_record_dirs,
+        "versions_repaired": repaired_versions,
+        "ecc_removed": ecc_removed,
+        "ecc_failed": ecc_failed,
+        "ecc_skipped_symlinks": ecc_skipped_symlinks,
+    }
