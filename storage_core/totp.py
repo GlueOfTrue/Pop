@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from .paths import get_totp_path
-from .util import canonical_json_bytes
+from .util import atomic_write_json, canonical_json_bytes
 
 TOTP_VERSION = 1
 AAD = b"gs-backup-totp-v1"
@@ -123,9 +123,7 @@ def save_totp_config(
     }
 
     path = get_totp_path(storage_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=True)
+    atomic_write_json(path, payload)
 
     return cfg
 

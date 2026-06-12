@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 from .paths import get_keystore_path
+from .util import atomic_write_json
 
 KDF_NAME = "scrypt"
 KDF_N = 2**15
@@ -59,9 +60,7 @@ def init_keystore(storage_root: Path, password: str) -> bytes:
         },
     }
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=True)
+    atomic_write_json(path, payload)
 
     return master_key
 

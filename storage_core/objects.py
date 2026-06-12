@@ -8,7 +8,7 @@ from typing import Optional, Tuple
 
 from .crypto import EncryptionResult, encrypt_stream
 from .paths import OBJECTS_DIRNAME
-from .util import DEFAULT_CHUNK_SIZE
+from .util import DEFAULT_CHUNK_SIZE, ensure_private_dir, fsync_parent_dir, set_private_permissions
 
 
 def get_objects_dir(storage_root: Path) -> Path:
@@ -40,12 +40,13 @@ def store_encrypted_object(
     Returns (encryption_result, dest_path, replaced_flag).
     """
     objects_dir = get_objects_dir(storage_root)
-    objects_dir.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(objects_dir)
 
     fd, tmp_name = tempfile.mkstemp(dir=objects_dir, prefix=".tmp-")
     tmp_path = Path(tmp_name)
     try:
         with os.fdopen(fd, "wb") as f_dst, src.open("rb") as f_src:
+            set_private_permissions(tmp_path)
             result = encrypt_stream(
                 f_src,
                 f_dst,
@@ -76,9 +77,13 @@ def store_encrypted_object(
             tmp_path.unlink(missing_ok=True)
             return result, dest, False
         tmp_path.replace(dest)
+        set_private_permissions(dest)
+        fsync_parent_dir(dest)
         return result, dest, True
 
     tmp_path.replace(dest)
+    set_private_permissions(dest)
+    fsync_parent_dir(dest)
     return result, dest, True
 
 

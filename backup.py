@@ -25,6 +25,8 @@ from storage_core import (
     list_public,
     open_file,
     prune_objects,
+    push_remote_mirror,
+    remote_status,
     restore_file,
     set_ui_language,
     totp_is_configured,
@@ -60,6 +62,8 @@ STRINGS = {
         "menu_totp_status": "Статус TOTP",
         "menu_totp_setup": "Настроить/обновить TOTP",
         "menu_totp_disable": "Отключить TOTP",
+        "menu_remote_status": "Статус Nextcloud mirror",
+        "menu_remote_push": "Отправить mirror в Nextcloud",
         "menu_lang": "Язык интерфейса",
         "menu_quit": "Выход",
         "prompt_path": "Путь к файлу: ",
@@ -123,6 +127,8 @@ STRINGS = {
         "menu_totp_status": "TOTP status",
         "menu_totp_setup": "Configure/rotate TOTP",
         "menu_totp_disable": "Disable TOTP",
+        "menu_remote_status": "Remote status",
+        "menu_remote_push": "Push remote mirror",
         "menu_lang": "Interface language",
         "menu_quit": "Quit",
         "prompt_path": "Path to file: ",
@@ -331,7 +337,9 @@ def _run_plain(master_key: bytes, lang: str) -> None:
         print("10) " + tr(lang, "menu_totp_status"))
         print("11) " + tr(lang, "menu_totp_setup"))
         print("12) " + tr(lang, "menu_totp_disable"))
-        print("13) " + tr(lang, "menu_lang"))
+        print("13) " + tr(lang, "menu_remote_status"))
+        print("14) " + tr(lang, "menu_remote_push"))
+        print("15) " + tr(lang, "menu_lang"))
         print("0) " + tr(lang, "menu_quit"))
 
         choice = _prompt(">> ")
@@ -464,7 +472,8 @@ def _run_plain(master_key: bytes, lang: str) -> None:
                     msg += (
                         f" | Versions removed {result['versions_removed']} "
                         f"| Docs removed {result['docs_removed']} "
-                        f"| Versions repaired {result['versions_repaired']}"
+                        f"| Versions repaired {result['versions_repaired']} "
+                        f"| Versions kept/problem {result.get('versions_kept_problem', 0)}"
                     )
                 if "ecc_removed" in result:
                     msg += f" | ECC removed {result['ecc_removed']}"
@@ -536,6 +545,18 @@ def _run_plain(master_key: bytes, lang: str) -> None:
             except Exception as exc:  # noqa: BLE001
                 print(f"ERROR: {exc}")
         elif choice == "13":
+            try:
+                status = remote_status(get_storage_root())
+                print(json.dumps(status, indent=2, ensure_ascii=True))
+            except Exception as exc:  # noqa: BLE001
+                print(f"ERROR: {exc}")
+        elif choice == "14":
+            try:
+                result = push_remote_mirror(get_storage_root(), master_key)
+                print(json.dumps(result, indent=2, ensure_ascii=True))
+            except Exception as exc:  # noqa: BLE001
+                print(f"ERROR: {exc}")
+        elif choice == "15":
             try:
                 current = lang
                 raw = _prompt(tr(lang, "prompt_language").format(current=current))
@@ -701,6 +722,8 @@ def _run_tui(master_key: bytes, lang: str) -> None:
             "menu_totp_status",
             "menu_totp_setup",
             "menu_totp_disable",
+            "menu_remote_status",
+            "menu_remote_push",
             "menu_lang",
             "menu_quit",
         ]
@@ -845,7 +868,8 @@ def _run_tui(master_key: bytes, lang: str) -> None:
                         msg += (
                             f" | Versions removed {result['versions_removed']} "
                             f"| Docs removed {result['docs_removed']} "
-                            f"| Versions repaired {result['versions_repaired']}"
+                            f"| Versions repaired {result['versions_repaired']} "
+                            f"| Versions kept/problem {result.get('versions_kept_problem', 0)}"
                         )
                     if "ecc_removed" in result:
                         msg += f" | ECC removed {result['ecc_removed']}"
@@ -904,6 +928,18 @@ def _run_tui(master_key: bytes, lang: str) -> None:
                         continue
                     clear_totp(get_storage_root(), master_key)
                     _message_tui(tr(lang, "totp_disabled"))
+                elif action == "menu_remote_status":
+                    status = remote_status(get_storage_root())
+                    _text_view(
+                        json.dumps(status, indent=2, ensure_ascii=True),
+                        tr(lang, "menu_remote_status"),
+                    )
+                elif action == "menu_remote_push":
+                    result = push_remote_mirror(get_storage_root(), master_key)
+                    _text_view(
+                        json.dumps(result, indent=2, ensure_ascii=True),
+                        tr(lang, "menu_remote_push"),
+                    )
                 elif action == "menu_lang":
                     current = lang
                     raw = _prompt_tui(tr(lang, "prompt_language").format(current=current))

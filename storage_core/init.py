@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import platform
 from pathlib import Path
 
@@ -14,6 +13,7 @@ from .paths import (
     get_catalog_path,
     get_records_dir,
 )
+from .util import atomic_write_json, ensure_private_dir
 
 
 def init_storage(storage_root: Path, verbose: bool = False) -> None:
@@ -26,8 +26,9 @@ def init_storage(storage_root: Path, verbose: bool = False) -> None:
     if not storage_root.exists():
         if verbose:
             print(f"[init] Creating storage at: {storage_root}")
-        storage_root.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(storage_root)
     else:
+        ensure_private_dir(storage_root)
         if verbose:
             print(f"[init] Storage directory already exists: {storage_root}")
 
@@ -44,30 +45,28 @@ def init_storage(storage_root: Path, verbose: bool = False) -> None:
                 "lang": "ru",
             },
         }
-        with config_path.open("w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2, ensure_ascii=True)
+        atomic_write_json(config_path, config)
         if verbose:
             print(f"[init] Created config: {config_path}")
     elif verbose:
         print(f"[init] Config already exists: {config_path}")
 
-    (storage_root / CATALOG_DIRNAME).mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(storage_root / CATALOG_DIRNAME)
     if not catalog_path.exists():
-        with catalog_path.open("w", encoding="utf-8") as f:
-            json.dump(empty_catalog(), f, indent=2, ensure_ascii=True)
+        atomic_write_json(catalog_path, empty_catalog())
         if verbose:
             print(f"[init] Created catalog: {catalog_path}")
     elif verbose:
         print(f"[init] Catalog already exists: {catalog_path}")
 
-    records_dir.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(records_dir)
     if verbose:
         print(f"[init] Records dir: {records_dir}")
 
-    objects_dir.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(objects_dir)
     if verbose:
         print(f"[init] Objects dir: {objects_dir}")
 
-    ecc_dir.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(ecc_dir)
     if verbose:
         print(f"[init] ECC dir: {ecc_dir}")

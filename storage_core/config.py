@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .paths import CONFIG_FILENAME
+from .util import atomic_write_json
 
 DEFAULT_LANG = "ru"
 SUPPORTED_LANGS = {"ru", "en"}
@@ -25,9 +26,7 @@ def load_config(storage_root: Path) -> Dict[str, Any]:
 
 def save_config(storage_root: Path, config: Dict[str, Any]) -> None:
     path = _config_path(storage_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=True)
+    atomic_write_json(path, config)
 
 
 def get_ui_language(storage_root: Path, default: str = DEFAULT_LANG) -> str:

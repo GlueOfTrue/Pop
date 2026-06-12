@@ -1,0 +1,4 @@
+cryptography
+qrcode
+pytest
+requests

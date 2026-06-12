@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import sys
 import getpass
+import tempfile
 from pathlib import Path
 
 from storage_core.crypto import (
@@ -21,7 +23,7 @@ from storage_core.crypto import (
 from storage_core.index import load_catalog
 from storage_core.keystore import unlock_keystore
 from storage_core.paths import get_record_path, get_storage_root
-from storage_core.util import canonical_json_bytes
+from storage_core.util import canonical_json_bytes, fsync_parent_dir, set_private_permissions
 
 
 def _read_nonce_and_flags(path: Path) -> tuple[bytes, int]:
@@ -110,9 +112,11 @@ def main() -> None:
     nonce, flags = _read_nonce_and_flags(obj_path)
     compressed = bool(flags & FLAG_COMPRESSED)
     compression_level = None
+    compression_algo = "zlib"
     if compressed:
         compression = content.get("compression", {})
         compression_level = compression.get("level")
+        compression_algo = compression.get("algo", "zlib")
         if compression_level is None:
             raise SystemExit("Metadata missing compression level")
 
@@ -123,24 +127,37 @@ def main() -> None:
     pub_bytes = canonical_json_bytes({"doc_id": doc_id, "name": args.name, "version": version})
     content_key = derive_version_key(master_key, doc_id, version, "content")
 
-    tmp_path = obj_path.with_suffix(".repair")
-    with source_path.open("rb") as src, tmp_path.open("wb") as dst:
-        result = encrypt_stream(
-            src,
-            dst,
-            key=content_key,
-            aad=pub_bytes,
-            compression_level=compression_level,
-            nonce=nonce,
-        )
+    fd, tmp_name = tempfile.mkstemp(dir=obj_path.parent, prefix=f".{obj_path.name}.", suffix=".repair")
+    tmp_path = Path(tmp_name)
+    try:
+        with source_path.open("rb") as src, os.fdopen(fd, "wb") as dst:
+            set_private_permissions(tmp_path)
+            result = encrypt_stream(
+                src,
+                dst,
+                key=content_key,
+                aad=pub_bytes,
+                compression_level=compression_level,
+                compression_algo=compression_algo,
+                nonce=nonce,
+            )
+            dst.flush()
+            os.fsync(dst.fileno())
 
-    if result.enc_hash_hex != enc_hash:
+        if result.enc_hash_hex != enc_hash:
+            raise SystemExit(
+                "Re-encryption mismatch. Source file may differ from stored version."
+            )
+
+        if obj_path.is_symlink():
+            raise SystemExit(f"Refusing to replace symlink object path: {obj_path}")
+        tmp_path.replace(obj_path)
+        set_private_permissions(obj_path)
+        fsync_parent_dir(obj_path)
+    except BaseException:
         tmp_path.unlink(missing_ok=True)
-        raise SystemExit(
-            "Re-encryption mismatch. Source file may differ from stored version."
-        )
+        raise
 
-    tmp_path.replace(obj_path)
     print(f"Repaired object: {obj_path}")
     print(f"Version: {version}  Document: {args.name}")
 

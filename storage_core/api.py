@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import platform
 import secrets
 import shutil
 import subprocess
-import tempfile
 import time
 from getpass import getpass
 from pathlib import Path
@@ -20,6 +20,8 @@ from .index import load_catalog, save_catalog
 from .keystore import get_or_init_master_key, keystore_exists, unlock_keystore
 from .objects import get_objects_dir, store_encrypted_object, verify_object_hash
 from .paths import get_ecc_dir, get_record_path, get_storage_root
+from .remote_nextcloud import push_mirror as nextcloud_push_mirror
+from .remote_nextcloud import remote_status as nextcloud_remote_status
 from .totp import (
     build_totp_uri,
     clear_totp_config,
@@ -29,7 +31,16 @@ from .totp import (
     save_totp_config,
     verify_totp,
 )
-from .util import canonical_json_bytes, normalize_original_path, now_utc_iso
+from .util import (
+    atomic_write_binary,
+    canonical_json_bytes,
+    ensure_private_dir,
+    make_private_temp_dir,
+    normalize_original_path,
+    safe_temp_basename,
+    set_private_permissions,
+    now_utc_iso,
+)
 
 FAST_ZLIB_LEVEL = 1
 FAST_ZSTD_LEVEL = 3
@@ -255,6 +266,8 @@ def add_file(
 
     root = _resolve_root(storage_root)
     file_path = Path(file_path)
+    if file_path.is_symlink():
+        raise RuntimeError(f"source path is a symlink: {file_path}")
     if not file_path.exists():
         raise FileNotFoundError(file_path)
     if not file_path.is_file():
@@ -274,11 +287,9 @@ def add_file(
             doc_id = existing_id
             break
 
-    is_new_doc = False
     if doc_id is None:
         doc_id = secrets.token_hex(16)
         docs[doc_id] = {"name": doc_name, "versions": []}
-        is_new_doc = True
 
     versions = docs[doc_id].get("versions", [])
     if not isinstance(versions, list):
@@ -330,8 +341,7 @@ def add_file(
     meta["meta_plain_hash"] = meta_plain_hash
 
     record_path = get_record_path(root, doc_id, version)
-    record_path.parent.mkdir(parents=True, exist_ok=True)
-    with record_path.open("wb") as record_file:
+    def write_record(record_file: io.BufferedWriter) -> None:
         encrypt_stream(
             io.BytesIO(canonical_json_bytes(meta)),
             record_file,
@@ -339,6 +349,7 @@ def add_file(
             aad=pub_bytes,
             compression_level=None,
         )
+    atomic_write_binary(record_path, write_record, overwrite=False)
 
     versions.append(version)
     catalog["docs"] = docs
@@ -681,11 +692,13 @@ def restore_file(
             raise ValueError("metadata missing source_path for restore")
 
     dest = Path(dest_path).expanduser().absolute()
+    if dest.is_symlink():
+        raise RuntimeError(f"destination is a symlink: {dest}")
+    if dest.parent.exists() and dest.parent.is_symlink():
+        raise RuntimeError(f"destination parent is a symlink: {dest.parent}")
     if dest.exists():
         if dest.is_dir():
             raise IsADirectoryError(dest)
-        if dest.is_symlink():
-            raise RuntimeError(f"destination is a symlink: {dest}")
         if not dest.is_file():
             raise RuntimeError(f"destination exists and is not a regular file: {dest}")
         if not force:
@@ -693,8 +706,9 @@ def restore_file(
     else:
         dest.parent.mkdir(parents=True, exist_ok=True)
 
-    with dest.open("wb") as out:
+    def write_restore(out: io.BufferedWriter) -> None:
         _decrypt_content_to_sink(root, master_key, doc_id, doc_name, version_idx, meta, out_stream=out)
+    atomic_write_binary(dest, write_restore, overwrite=force, private_parent=False)
 
     return {"doc": doc_name, "version": version_idx, "destination": str(dest)}
 
@@ -734,11 +748,13 @@ def open_file(
     _require_auth(root, master_key, "open file")
     meta = _load_record(root, master_key, doc_id, doc_name, version_idx)
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="gs-backup-open-"))
-    basename = doc_name or f"{doc_id}-{version_idx}"
+    tmpdir = make_private_temp_dir("gs-backup-open-")
+    basename = safe_temp_basename(doc_name, fallback=f"{doc_id}-{version_idx}")
     dest = tmpdir / basename
 
-    with dest.open("wb") as out:
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as out:
+        set_private_permissions(dest)
         _decrypt_content_to_sink(root, master_key, doc_id, doc_name, version_idx, meta, out_stream=out)
 
     try:
@@ -885,7 +901,7 @@ def get_stats(storage_root: Optional[Path], master_key: bytes) -> dict:
     }
 
 
-def prune_objects(storage_root: Optional[Path], master_key: bytes) -> dict:
+def prune_objects(storage_root: Optional[Path], master_key: bytes, aggressive: bool = False) -> dict:
     root = _resolve_root(storage_root)
     catalog = load_catalog(root)
     docs = catalog.get("docs", {})
@@ -901,6 +917,9 @@ def prune_objects(storage_root: Optional[Path], master_key: bytes) -> dict:
     removed_docs = 0
     removed_record_dirs = 0
     repaired_versions = 0
+    kept_problem_versions = 0
+    corrupted_versions = 0
+    uncertain_references = False
 
     for doc_id, doc in list(docs.items()):
         if not isinstance(doc, dict):
@@ -916,35 +935,59 @@ def prune_objects(storage_root: Optional[Path], master_key: bytes) -> dict:
             try:
                 meta = _load_record(root, master_key, doc_id, name, version)
             except FileNotFoundError:
-                removed_versions += 1
-                if record_path.exists():
-                    try:
-                        record_path.unlink()
-                        removed_records += 1
-                    except OSError:
-                        pass
+                if aggressive:
+                    removed_versions += 1
+                    if record_path.exists():
+                        try:
+                            record_path.unlink()
+                            removed_records += 1
+                        except OSError:
+                            pass
+                else:
+                    kept_problem_versions += 1
+                    uncertain_references = True
+                    kept_versions.append(version)
                 continue
             except Exception:
-                removed_versions += 1
-                if record_path.exists():
-                    try:
-                        record_path.unlink()
-                        removed_records += 1
-                    except OSError:
-                        pass
+                if aggressive:
+                    removed_versions += 1
+                    if record_path.exists():
+                        try:
+                            record_path.unlink()
+                            removed_records += 1
+                        except OSError:
+                            pass
+                else:
+                    kept_problem_versions += 1
+                    uncertain_references = True
+                    kept_versions.append(version)
                 continue
 
             content = meta.get("content", {})
             enc_hash = content.get("enc_hash")
             enc_size = content.get("enc_size")
             if not enc_hash:
-                removed_versions += 1
-                try:
-                    record_path.unlink()
-                    removed_records += 1
-                except OSError:
-                    pass
+                if aggressive:
+                    removed_versions += 1
+                    try:
+                        record_path.unlink()
+                        removed_records += 1
+                    except OSError:
+                        pass
+                else:
+                    kept_problem_versions += 1
+                    uncertain_references = True
+                    kept_versions.append(version)
                 continue
+
+            referenced_hashes.add(enc_hash)
+            ecc = meta.get("ecc")
+            if isinstance(ecc, dict) and ecc.get("enabled"):
+                parity = ecc.get("parity", {})
+                if isinstance(parity, dict):
+                    parity_hash = parity.get("hash")
+                    if parity_hash:
+                        referenced_parity.add(parity_hash)
 
             status, _reason, _size, _hash = verify_object_hash(
                 root,
@@ -963,23 +1006,20 @@ def prune_objects(storage_root: Optional[Path], master_key: bytes) -> dict:
                         if status == "ok":
                             repaired_versions += 1
                 if status != "ok":
-                    removed_versions += 1
-                    try:
-                        record_path.unlink()
-                        removed_records += 1
-                    except OSError:
-                        pass
+                    corrupted_versions += 1
+                    if aggressive:
+                        removed_versions += 1
+                        try:
+                            record_path.unlink()
+                            removed_records += 1
+                        except OSError:
+                            pass
+                    else:
+                        kept_problem_versions += 1
+                        kept_versions.append(version)
                     continue
 
             kept_versions.append(version)
-            referenced_hashes.add(enc_hash)
-            ecc = meta.get("ecc")
-            if isinstance(ecc, dict) and ecc.get("enabled"):
-                parity = ecc.get("parity", {})
-                if isinstance(parity, dict):
-                    parity_hash = parity.get("hash")
-                    if parity_hash:
-                        referenced_parity.add(parity_hash)
 
         if kept_versions:
             doc["versions"] = kept_versions
@@ -1006,7 +1046,7 @@ def prune_objects(storage_root: Optional[Path], master_key: bytes) -> dict:
             if obj.is_symlink():
                 skipped_symlinks += 1
                 continue
-            if obj.is_file() and obj.name not in referenced_hashes:
+            if obj.is_file() and obj.name not in referenced_hashes and not uncertain_references:
                 try:
                     obj.unlink()
                     removed += 1
@@ -1022,7 +1062,7 @@ def prune_objects(storage_root: Optional[Path], master_key: bytes) -> dict:
             if obj.is_symlink():
                 ecc_skipped_symlinks += 1
                 continue
-            if obj.is_file() and obj.name not in referenced_parity:
+            if obj.is_file() and obj.name not in referenced_parity and not uncertain_references:
                 try:
                     obj.unlink()
                     ecc_removed += 1
@@ -1038,7 +1078,21 @@ def prune_objects(storage_root: Optional[Path], master_key: bytes) -> dict:
         "docs_removed": removed_docs,
         "record_dirs_removed": removed_record_dirs,
         "versions_repaired": repaired_versions,
+        "versions_kept_problem": kept_problem_versions,
+        "versions_corrupted": corrupted_versions,
+        "prune_blocked_by_uncertain_references": uncertain_references,
         "ecc_removed": ecc_removed,
         "ecc_failed": ecc_failed,
         "ecc_skipped_symlinks": ecc_skipped_symlinks,
     }
+
+
+def remote_status(storage_root: Optional[Path]) -> dict:
+    root = _resolve_root(storage_root)
+    return nextcloud_remote_status(root)
+
+
+def push_remote_mirror(storage_root: Optional[Path], master_key: bytes) -> dict:
+    root = _resolve_root(storage_root)
+    _require_auth(root, master_key, "push remote mirror")
+    return nextcloud_push_mirror(root)

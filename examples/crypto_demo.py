@@ -1,3 +1,9 @@
+"""
+Educational AES-GCM demo only.
+Not used by Pop's storage core.
+Real vault keys are managed by storage_core.keystore.
+"""
+
 import base64
 import getpass
 import hashlib

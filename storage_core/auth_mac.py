@@ -9,6 +9,7 @@ Returns True on successful auth, False otherwise.
 
 import tempfile
 import textwrap
+import json
 import os
 import subprocess
 from typing import Optional
@@ -24,6 +25,7 @@ def _auth_via_swift_la(reason: str, timeout: int) -> Optional[bool]:
         import LocalAuthentication
         import Foundation
 
+        let reason = CommandLine.arguments.dropFirst().joined(separator: " ")
         let context = LAContext()
         var error: NSError?
 
@@ -36,7 +38,7 @@ def _auth_via_swift_la(reason: str, timeout: int) -> Optional[bool]:
         let sem = DispatchSemaphore(value: 0)
         var ok = false
 
-        context.evaluatePolicy(policy, localizedReason: "{reason}") {{
+        context.evaluatePolicy(policy, localizedReason: reason) {{
             success, _ in
             ok = success
             sem.signal()
@@ -55,7 +57,7 @@ def _auth_via_swift_la(reason: str, timeout: int) -> Optional[bool]:
     swift_bin = "/usr/bin/swift"
     try:
         proc = subprocess.run(
-            [swift_bin, tmp_path],
+            [swift_bin, tmp_path, reason],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -80,6 +82,7 @@ def _auth_via_local_auth(reason: str, timeout: int) -> Optional[bool]:
     Use JavaScript for Automation to call LocalAuthentication.
     Returns True/False, or None if failed/unavailable so we can fall back.
     """
+    reason_literal = json.dumps(f"Authenticate to {reason}")
     script = r'''
 ObjC.import('LocalAuthentication');
 ObjC.import('dispatch');
@@ -99,7 +102,7 @@ if (!ctx.canEvaluatePolicyError(policy, err)) {
 
 var ok = false;
 var sem = $.dispatch_semaphore_create(0);
-ctx.evaluatePolicyLocalizedReasonReply(policy, ObjC.wrap("Authenticate to %(reason)s"), function(success, error){
+ctx.evaluatePolicyLocalizedReasonReply(policy, ObjC.wrap(%(reason_literal)s), function(success, error){
   ok = success;
   $.dispatch_semaphore_signal(sem);
 });
@@ -107,7 +110,7 @@ ctx.evaluatePolicyLocalizedReasonReply(policy, ObjC.wrap("Authenticate to %(reas
 $.dispatch_semaphore_wait(sem, $.DISPATCH_TIME_FOREVER);
 println(ok ? "OK" : "DENY");
 $.exit(ok ? 0 : 1);
-'''.replace("%(reason)s", reason.replace('"', '\\"'))
+'''.replace("%(reason_literal)s", reason_literal)
 
     try:
         proc = subprocess.run(

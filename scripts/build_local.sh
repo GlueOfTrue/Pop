@@ -39,13 +39,13 @@ fi
 
 PIP_BIN="${VENV_DIR}/bin/pip"
 PY_BIN="${VENV_DIR}/bin/python"
-PYI_BIN="${VENV_DIR}/bin/pyinstaller"
 
-log "Installing dependencies..."
+log "Installing build dependencies..."
 "${PIP_BIN}" install --upgrade pip
-"${PIP_BIN}" install cryptography pillow pyinstaller qrcode
+"${PIP_BIN}" install -r requirements-build.txt
 
-log "Building binary..."
-"${PYI_BIN}" --clean --noconfirm --name gs-backup-storage --onefile --console backup.py
+log "Building app package..."
+"${PY_BIN}" scripts/build_app.py
 
-log "Done: dist/gs-backup-storage"
+log "Done. Artifacts:"
+ls -1 dist/Pop-* 2>/dev/null || true
