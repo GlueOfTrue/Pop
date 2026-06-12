@@ -38,6 +38,7 @@ Pop assumes remote storage is untrusted and should only receive encrypted vault 
 Local auth and optional TOTP are interactive gates for protected operations such as metadata access, restore, verify, and open. They do not replace encryption, and TOTP does not protect against offline brute-force of a copied vault. Paranoid open reduces the lifetime of a named plaintext file, but it is not an anti-forensics guarantee.
 
 See [docs/threat-model.md](docs/threat-model.md) and [SECURITY.md](SECURITY.md) before using Pop with real data.
+Implementation notes for reviewers are in [docs/reviewer-notes.md](docs/reviewer-notes.md).
 
 ## Quick Start
 
