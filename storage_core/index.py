@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from .paths import get_catalog_path
+from .util import atomic_write_json
 
 
 def empty_catalog() -> dict:
@@ -24,11 +25,7 @@ def load_catalog(storage_root: Path) -> dict:
 
 def save_catalog(storage_root: Path, catalog: dict) -> None:
     catalog_path = get_catalog_path(storage_root)
-    tmp_path = catalog_path.with_suffix(".tmp")
-    catalog_path.parent.mkdir(parents=True, exist_ok=True)
-    with tmp_path.open("w", encoding="utf-8") as f:
-        json.dump(catalog, f, indent=2, ensure_ascii=True)
-    tmp_path.replace(catalog_path)
+    atomic_write_json(catalog_path, catalog)
 
 
 def get_doc_by_name(catalog: dict, name: str) -> Optional[Tuple[str, dict]]:
