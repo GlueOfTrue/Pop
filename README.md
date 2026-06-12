@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/GlueOfTrue/Pop/actions/workflows/tests.yml/badge.svg)](https://github.com/GlueOfTrue/Pop/actions/workflows/tests.yml)
 
-Pop is an experimental local-first encrypted backup vault with file versioning, integrity verification, Touch ID/TOTP authorization, paranoid file viewing, and planned Nextcloud/WebDAV mirroring.
+Pop is an experimental local-first encrypted backup vault with file versioning, integrity verification, Touch ID/TOTP authorization, paranoid file viewing, and an early Nextcloud/WebDAV push mirror.
 
 Pop is not production-ready. Do not use it as the only copy of important data yet, and review the threat model before using it with anything sensitive.
 
@@ -27,7 +27,7 @@ The current prototype keeps the working storage core small: files are encrypted 
 - macOS Touch ID/LocalAuthentication hook with sudo fallback.
 - Linux/POSIX sudo authorization.
 - Experimental XOR parity ECC repair for one corrupted block per stripe.
-- Planned Nextcloud/WebDAV mirror of encrypted vault data.
+- Initial Nextcloud/WebDAV push+status mirror for encrypted vault data.
 - Planned read-only Linux FUSE browsing.
 
 ## Security Model In One Minute
@@ -67,11 +67,13 @@ For a safe manual walkthrough, use a temporary vault:
 
 The full reviewer demo is in [docs/demo.md](docs/demo.md). Be careful with `secure` mode: it deletes the source file after storing it.
 
+For the experimental Nextcloud/WebDAV push mirror, see [docs/nextcloud.md](docs/nextcloud.md).
+
 ## Current Limitations
 
 - Experimental prototype with no security audit.
 - Not suitable as the only copy of important files.
-- No remote mirror implementation yet.
+- Remote mirror is push+status only; there is no pull, remote delete, conflict handling, or rollback protection yet.
 - No retention policy or version pruning policy yet.
 - No full encrypted filesystem and no writable FUSE layer.
 - Paranoid open cannot stop viewer caches, thumbnails, swap, screenshots, recent-file lists, or autosave leaks.
@@ -80,7 +82,7 @@ The full reviewer demo is in [docs/demo.md](docs/demo.md). Be careful with `secu
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). The near-term goal is a v0.1-alpha polish pass: documentation, safe demo, tests, CI, atomic-write hardening, and packaging basics. Later milestones cover Nextcloud/WebDAV mirroring, storage efficiency, and a read-only Linux FUSE browsing layer.
+See [ROADMAP.md](ROADMAP.md). The near-term goal is a v0.1-alpha polish pass: documentation, safe demo, tests, CI, hardening, packaging basics, and a conservative Nextcloud/WebDAV push mirror. Later milestones cover pull/conflict handling, storage efficiency, and a read-only Linux FUSE browsing layer.
 
 ## Design Inspirations
 

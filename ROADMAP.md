@@ -12,9 +12,9 @@ This roadmap is intentionally conservative. Pop is an early prototype, and clari
 
 ## v0.2 Remote Mirror
 
-- Nextcloud/WebDAV push, pull, and status commands.
+- Harden the initial Nextcloud/WebDAV push+status bridge.
+- Pull and conflict handling.
 - Remote verification of mirrored ciphertext and protected metadata.
-- Conflict handling for local and remote changes.
 - Remote rollback notes and initial anti-rollback design.
 
 ## v0.3 Storage Efficiency

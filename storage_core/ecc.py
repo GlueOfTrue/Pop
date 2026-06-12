@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import List
 
 from .objects import sha256_file
+from .util import ensure_private_dir, fsync_parent_dir, set_private_permissions
 
 
 def _xor_into(parity: bytearray, block: bytes) -> None:
@@ -27,7 +28,7 @@ def compute_ecc(
     if not obj_path.exists():
         raise FileNotFoundError(obj_path)
 
-    ecc_dir.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(ecc_dir)
     fd, tmp_name = tempfile.mkstemp(dir=ecc_dir, prefix=".tmp-")
     tmp_path = Path(tmp_name)
 
@@ -41,6 +42,7 @@ def compute_ecc(
 
     try:
         with os.fdopen(fd, "wb") as dst, obj_path.open("rb") as src:
+            set_private_permissions(tmp_path)
             while True:
                 block = src.read(block_size)
                 if not block:
@@ -77,8 +79,12 @@ def compute_ecc(
             tmp_path.unlink(missing_ok=True)
         else:
             tmp_path.replace(parity_path)
+            set_private_permissions(parity_path)
+            fsync_parent_dir(parity_path)
     else:
         tmp_path.replace(parity_path)
+        set_private_permissions(parity_path)
+        fsync_parent_dir(parity_path)
 
     return {
         "parity_hash": parity_hash_hex,

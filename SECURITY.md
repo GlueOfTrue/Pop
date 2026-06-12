@@ -12,6 +12,8 @@ For sensitive security issues, ask the maintainer for a private contact channel 
 
 Pop is designed to reduce exposure when encrypted vault data is copied to untrusted storage. Remote storage should see ciphertext, public catalog data, and protected metadata only.
 
+The current Nextcloud/WebDAV bridge is push+status only. Remote data and the remote manifest are not trusted for restore, rollback, deletion, pruning, or conflict resolution.
+
 Pop does not protect against malware running on the client while the vault is unlocked, keyloggers, screen capture malware, weak master passwords, a compromised Python runtime, or a compromised operating system.
 
 Viewer applications may leak plaintext into caches, thumbnails, recent-file databases, autosave files, swap, screenshots, or other local artifacts. Paranoid open reduces the lifetime of a named plaintext path but does not prevent those leaks.
