@@ -14,6 +14,8 @@ Pop is designed to reduce exposure when encrypted vault data is copied to untrus
 
 The current Nextcloud/WebDAV bridge is push+status only. Remote data and the remote manifest are not trusted for restore, rollback, deletion, pruning, or conflict resolution.
 
+On Linux, Pop refuses local authorization while running as root unless `POP_ALLOW_ROOT=1` is set. This is a guardrail against root-owned vault files and against weakening the local-user authorization model.
+
 Pop does not protect against malware running on the client while the vault is unlocked, keyloggers, screen capture malware, weak master passwords, a compromised Python runtime, or a compromised operating system.
 
 Viewer applications may leak plaintext into caches, thumbnails, recent-file databases, autosave files, swap, screenshots, or other local artifacts. Paranoid open reduces the lifetime of a named plaintext path but does not prevent those leaks.

@@ -7,7 +7,6 @@ import platform
 import secrets
 import shutil
 import subprocess
-import tempfile
 import time
 from getpass import getpass
 from pathlib import Path
@@ -36,6 +35,7 @@ from .util import (
     atomic_write_binary,
     canonical_json_bytes,
     ensure_private_dir,
+    make_private_temp_dir,
     normalize_original_path,
     safe_temp_basename,
     set_private_permissions,
@@ -748,8 +748,7 @@ def open_file(
     _require_auth(root, master_key, "open file")
     meta = _load_record(root, master_key, doc_id, doc_name, version_idx)
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="gs-backup-open-"))
-    ensure_private_dir(tmpdir)
+    tmpdir = make_private_temp_dir("gs-backup-open-")
     basename = safe_temp_basename(doc_name, fallback=f"{doc_id}-{version_idx}")
     dest = tmpdir / basename
 

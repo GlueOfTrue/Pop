@@ -8,7 +8,7 @@ This roadmap is intentionally conservative. Pop is an early prototype, and clari
 - Pytest roundtrip tests for the storage core.
 - GitHub Actions CI for tests.
 - Safer atomic writes and fsync behavior where practical.
-- Packaging basics for local development.
+- Linux/macOS packaging basics for local development and downloadable CI artifacts.
 
 ## v0.2 Remote Mirror
 

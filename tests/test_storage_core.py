@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 from cryptography.exceptions import InvalidTag
 
+import storage_core.auth as auth
 import storage_core.api as api
+import storage_core.util as util
 from storage_core import (
     add_file,
     init_storage,
@@ -188,3 +190,26 @@ def test_prune_keeps_corrupted_referenced_version_by_default(
     assert result["versions_corrupted"] == 1
     assert object_path.exists()
     assert next(iter(catalog["docs"].values()))["versions"] == [1]
+
+
+def test_private_temp_dir_prefers_safe_linux_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    monkeypatch.setattr(util.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(util.os, "geteuid", lambda: runtime.stat().st_uid)
+
+    temp_dir = util.make_private_temp_dir("pop-test-")
+
+    assert temp_dir.parent == runtime
+    assert temp_dir.stat().st_mode & 0o777 == 0o700
+
+
+def test_linux_auth_rejects_root_without_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(auth.ROOT_OVERRIDE_ENV, raising=False)
+    monkeypatch.setattr(auth.os, "geteuid", lambda: 0)
+
+    assert auth._auth_via_sudo("restore\nfile") is False

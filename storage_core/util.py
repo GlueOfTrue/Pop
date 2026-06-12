@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import stat
 import tempfile
@@ -49,6 +50,8 @@ def set_private_permissions(path: Path, *, is_dir: bool = False) -> None:
 
 
 def ensure_private_dir(path: Path) -> None:
+    if path.is_symlink():
+        raise RuntimeError(f"refusing to use symlink as private directory: {path}")
     path.mkdir(parents=True, exist_ok=True)
     set_private_permissions(path, is_dir=True)
 
@@ -143,3 +146,35 @@ def safe_temp_basename(name: str | None, fallback: str = "document") -> str:
     if cleaned in {"", ".", ".."}:
         cleaned = fallback
     return cleaned[:160]
+
+
+def _safe_linux_runtime_parent() -> Path | None:
+    if platform.system() != "Linux":
+        return None
+    xdg_runtime = os.getenv("XDG_RUNTIME_DIR")
+    if xdg_runtime:
+        path = Path(xdg_runtime)
+        try:
+            st = path.stat()
+        except OSError:
+            st = None
+        if (
+            st is not None
+            and path.is_dir()
+            and not path.is_symlink()
+            and st.st_uid == os.geteuid()
+            and stat.S_IMODE(st.st_mode) & 0o077 == 0
+        ):
+            return path
+
+    shm = Path("/dev/shm")
+    if shm.is_dir() and not shm.is_symlink():
+        return shm
+    return None
+
+
+def make_private_temp_dir(prefix: str) -> Path:
+    parent = _safe_linux_runtime_parent()
+    tmpdir = Path(tempfile.mkdtemp(prefix=prefix, dir=parent))
+    ensure_private_dir(tmpdir)
+    return tmpdir

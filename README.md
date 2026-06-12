@@ -28,6 +28,7 @@ The current prototype keeps the working storage core small: files are encrypted 
 - Linux/POSIX sudo authorization.
 - Experimental XOR parity ECC repair for one corrupted block per stripe.
 - Initial Nextcloud/WebDAV push+status mirror for encrypted vault data.
+- Linux/macOS PyInstaller app packaging.
 - Planned read-only Linux FUSE browsing.
 
 ## Security Model In One Minute
@@ -39,6 +40,8 @@ Local auth and optional TOTP are interactive gates for protected operations such
 See [docs/threat-model.md](docs/threat-model.md) and [SECURITY.md](SECURITY.md) before using Pop with real data.
 
 ## Quick Start
+
+Downloadable app artifacts are built for Linux and macOS in GitHub Actions. See [docs/packaging.md](docs/packaging.md) for artifact layout and local build commands.
 
 ```bash
 python3 -m venv .venv
@@ -76,13 +79,14 @@ For the experimental Nextcloud/WebDAV push mirror, see [docs/nextcloud.md](docs/
 - Remote mirror is push+status only; there is no pull, remote delete, conflict handling, or rollback protection yet.
 - No retention policy or version pruning policy yet.
 - No full encrypted filesystem and no writable FUSE layer.
+- App packages are unsigned early artifacts.
 - Paranoid open cannot stop viewer caches, thumbnails, swap, screenshots, recent-file lists, or autosave leaks.
 - Malicious remote rollback is not solved without trusted local state or a future anti-rollback design.
 - A compromised OS, Python runtime, or unlocked client can read plaintext during normal operations.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). The near-term goal is a v0.1-alpha polish pass: documentation, safe demo, tests, CI, hardening, packaging basics, and a conservative Nextcloud/WebDAV push mirror. Later milestones cover pull/conflict handling, storage efficiency, and a read-only Linux FUSE browsing layer.
+See [ROADMAP.md](ROADMAP.md). The near-term goal is a v0.1-alpha polish pass: documentation, safe demo, tests, CI, hardening, Linux/macOS packaging basics, and a conservative Nextcloud/WebDAV push mirror. Later milestones cover pull/conflict handling, storage efficiency, and a read-only Linux FUSE browsing layer.
 
 ## Design Inspirations
 

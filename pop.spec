@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='gs-backup-storage',
+    name='pop',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
